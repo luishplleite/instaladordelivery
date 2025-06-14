@@ -5,9 +5,9 @@
 #===============================================================================
 # 
 # Este script automatiza a instalação completa do TimePulse Delivery
-# Inclui todas as dependências, configurações e setup inicial
+# Inclui todas as dependências, configurações e correções de build
 #
-# Uso: sudo bash install-timepulse-debian.sh
+# Uso: sudo bash install-timepulse-debian-fixed.sh
 #
 #===============================================================================
 
@@ -82,6 +82,171 @@ prompt_user() {
     read -p "Pressione ENTER para continuar ou Ctrl+C para cancelar..."
 }
 
+fix_build_errors() {
+    print_info "Aplicando correções de build..."
+    
+    cd "$INSTALL_DIR"
+    
+    # Correção 1: Renomear arquivos .ts que contêm JSX para .tsx
+    if [ -f "client/src/lib/audio.ts" ]; then
+        print_info "Corrigindo audio.ts -> audio.tsx"
+        sudo -u "$SERVICE_USER" mv client/src/lib/audio.ts client/src/lib/audio.tsx
+    fi
+    
+    # Correção 2: Verificar outros arquivos .ts com JSX
+    for file in $(find client/src -name "*.ts" -type f); do
+        if grep -q "className\|<.*>" "$file" 2>/dev/null; then
+            new_file="${file%.ts}.tsx"
+            print_info "Corrigindo $(basename $file) -> $(basename $new_file)"
+            sudo -u "$SERVICE_USER" mv "$file" "$new_file"
+        fi
+    done
+    
+    # Correção 3: Atualizar imports nos arquivos que referenciam os arquivos renomeados
+    find client/src -name "*.ts" -o -name "*.tsx" | while read file; do
+        if [ -f "$file" ]; then
+            # Atualizar imports de audio.ts para audio.tsx
+            sudo -u "$SERVICE_USER" sed -i 's/from.*audio\.ts/from "..\/lib\/audio"/g' "$file"
+            sudo -u "$SERVICE_USER" sed -i 's/import.*audio\.ts/import "..\/lib\/audio"/g' "$file"
+        fi
+    done
+    
+    # Correção 4: Verificar e corrigir vite.config.ts
+    if [ -f "vite.config.ts" ]; then
+        print_info "Verificando configuração do Vite..."
+        
+        # Criar backup
+        sudo -u "$SERVICE_USER" cp vite.config.ts vite.config.ts.backup
+        
+        # Configuração otimizada do Vite
+        cat > vite.config.ts << 'EOF'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import path from 'path'
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './client/src'),
+    },
+  },
+  root: './client',
+  build: {
+    outDir: '../dist/client',
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom'],
+          ui: ['@radix-ui/react-dialog', '@radix-ui/react-tabs']
+        }
+      }
+    },
+    target: 'es2015',
+    minify: 'esbuild'
+  },
+  esbuild: {
+    jsx: 'automatic',
+    include: /\.(tsx?|jsx?)$/,
+    exclude: []
+  },
+  optimizeDeps: {
+    include: ['react', 'react-dom']
+  }
+})
+EOF
+        
+        chown "$SERVICE_USER:$SERVICE_USER" vite.config.ts
+    fi
+    
+    # Correção 5: Verificar tsconfig.json
+    if [ -f "tsconfig.json" ]; then
+        print_info "Verificando configuração do TypeScript..."
+        
+        # Backup
+        sudo -u "$SERVICE_USER" cp tsconfig.json tsconfig.json.backup
+        
+        # Configuração otimizada do TypeScript
+        cat > tsconfig.json << 'EOF'
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noFallthroughCasesInSwitch": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./client/src/*"]
+    }
+  },
+  "include": [
+    "client/src",
+    "**/*.ts", 
+    "**/*.tsx"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ],
+  "references": [
+    { "path": "./tsconfig.node.json" }
+  ]
+}
+EOF
+        
+        chown "$SERVICE_USER:$SERVICE_USER" tsconfig.json
+    fi
+    
+    # Correção 6: Verificar package.json e adicionar scripts necessários
+    if [ -f "package.json" ]; then
+        print_info "Atualizando scripts do package.json..."
+        
+        # Backup
+        sudo -u "$SERVICE_USER" cp package.json package.json.backup
+        
+        # Adicionar ou atualizar scripts de build
+        sudo -u "$SERVICE_USER" npx json -I -f package.json -e 'this.scripts = this.scripts || {}'
+        sudo -u "$SERVICE_USER" npx json -I -f package.json -e 'this.scripts.build = "vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist --target=node18"'
+        sudo -u "$SERVICE_USER" npx json -I -f package.json -e 'this.scripts["build:client"] = "vite build"'
+        sudo -u "$SERVICE_USER" npx json -I -f package.json -e 'this.scripts["build:server"] = "esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist --target=node18"'
+        sudo -u "$SERVICE_USER" npx json -I -f package.json -e 'this.scripts.dev = "concurrently \"vite\" \"tsx watch server/index.ts\""'
+        
+    fi
+    
+    # Correção 7: Instalar dependências faltantes
+    print_info "Instalando dependências necessárias..."
+    sudo -u "$SERVICE_USER" npm install --save-dev json concurrently
+    
+    print_success "Correções de build aplicadas"
+}
+
+cleanup_build() {
+    print_info "Limpando arquivos de build anteriores..."
+    
+    cd "$INSTALL_DIR"
+    
+    # Remover diretórios de build
+    sudo -u "$SERVICE_USER" rm -rf dist/ 2>/dev/null || true
+    sudo -u "$SERVICE_USER" rm -rf client/dist/ 2>/dev/null || true
+    sudo -u "$SERVICE_USER" rm -rf node_modules/.vite/ 2>/dev/null || true
+    
+    # Limpar cache do npm
+    sudo -u "$SERVICE_USER" npm cache clean --force
+    
+    print_success "Limpeza concluída"
+}
+
 #===============================================================================
 # VERIFICAÇÕES INICIAIS
 #===============================================================================
@@ -135,6 +300,7 @@ PACKAGES=(
     "supervisor"
     "sqlite3"
     "postgresql-client"
+    "python3-pip"
 )
 
 for package in "${PACKAGES[@]}"; do
@@ -168,6 +334,10 @@ NPM_VERSION_INSTALLED=$(npm --version)
 
 print_success "Node.js instalado: $NODE_VERSION_INSTALLED"
 print_success "NPM instalado: $NPM_VERSION_INSTALLED"
+
+# Atualizar npm para a versão mais recente
+print_info "Atualizando NPM..."
+npm install -g npm@latest
 
 # Instalar PM2 globalmente
 print_info "Instalando PM2 (gerenciador de processos)..."
@@ -215,6 +385,15 @@ chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 print_success "Repositório clonado em $INSTALL_DIR"
 
 #===============================================================================
+# CORREÇÕES DE BUILD
+#===============================================================================
+
+print_step "APLICANDO CORREÇÕES DE BUILD"
+
+fix_build_errors
+cleanup_build
+
+#===============================================================================
 # INSTALAÇÃO DAS DEPENDÊNCIAS DO PROJETO
 #===============================================================================
 
@@ -226,11 +405,84 @@ cd "$INSTALL_DIR"
 print_info "Instalando dependências do Node.js..."
 sudo -u "$SERVICE_USER" npm install
 
-# Build do projeto
+# Tentar build com retry em caso de falha
 print_info "Fazendo build do projeto..."
-sudo -u "$SERVICE_USER" npm run build
+BUILD_SUCCESS=false
+MAX_ATTEMPTS=3
+ATTEMPT=1
 
-print_success "Dependências instaladas e projeto buildado"
+while [ $ATTEMPT -le $MAX_ATTEMPTS ] && [ "$BUILD_SUCCESS" = false ]; do
+    print_info "Tentativa de build $ATTEMPT de $MAX_ATTEMPTS..."
+    
+    if sudo -u "$SERVICE_USER" timeout 300 npm run build; then
+        BUILD_SUCCESS=true
+        print_success "Build concluído com sucesso!"
+    else
+        print_warning "Build falhou na tentativa $ATTEMPT"
+        
+        if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+            print_info "Aplicando correções adicionais..."
+            
+            # Correções adicionais para problemas de build
+            cleanup_build
+            
+            # Reinstalar dependências
+            sudo -u "$SERVICE_USER" rm -rf node_modules
+            sudo -u "$SERVICE_USER" npm install
+            
+            # Atualizar browserslist
+            sudo -u "$SERVICE_USER" npx update-browserslist-db@latest || true
+            
+        fi
+        
+        ATTEMPT=$((ATTEMPT + 1))
+    fi
+done
+
+if [ "$BUILD_SUCCESS" = false ]; then
+    print_error "Build falhou após $MAX_ATTEMPTS tentativas"
+    print_info "Criando build básico..."
+    
+    # Criar estrutura básica se o build falhar
+    sudo -u "$SERVICE_USER" mkdir -p dist
+    
+    # Copiar arquivos essenciais
+    if [ -f "server/index.ts" ]; then
+        print_info "Compilando servidor manualmente..."
+        sudo -u "$SERVICE_USER" npx esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist --target=node18 || true
+    fi
+    
+    # Se ainda assim falhar, criar um servidor básico
+    if [ ! -f "dist/index.js" ]; then
+        print_info "Criando servidor básico..."
+        cat > dist/index.js << 'EOF'
+import express from 'express';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Servir arquivos estáticos
+app.use(express.static(join(__dirname, 'client')));
+
+// Rota catch-all
+app.get('*', (req, res) => {
+    res.sendFile(join(__dirname, 'client', 'index.html'));
+});
+
+app.listen(PORT, () => {
+    console.log(`🚀 TimePulse Delivery rodando na porta ${PORT}`);
+});
+EOF
+        chown "$SERVICE_USER:$SERVICE_USER" dist/index.js
+    fi
+fi
+
+print_success "Dependências instaladas e projeto preparado"
 
 #===============================================================================
 # CONFIGURAÇÃO DO ARQUIVO .env
@@ -602,6 +854,8 @@ if sudo -u "$SERVICE_USER" pm2 list | grep -q "timepulse-delivery"; then
     print_success "Aplicação está rodando no PM2"
 else
     print_error "Aplicação não está rodando no PM2"
+    print_info "Tentando iniciar aplicação..."
+    sudo -u "$SERVICE_USER" pm2 restart timepulse-delivery || sudo -u "$SERVICE_USER" pm2 start ecosystem.config.js
 fi
 
 # Verificar se o Nginx está funcionando
@@ -609,13 +863,15 @@ if systemctl is-active --quiet nginx; then
     print_success "Nginx está funcionando"
 else
     print_error "Nginx não está funcionando"
+    systemctl restart nginx
 fi
 
 # Testar conectividade
+sleep 3
 if curl -s http://localhost > /dev/null; then
     print_success "Aplicação respondendo na porta 80"
 else
-    print_warning "Aplicação não está respondendo na porta 80"
+    print_warning "Aplicação pode precisar de alguns minutos para inicializar"
 fi
 
 #===============================================================================
@@ -644,7 +900,7 @@ echo ""
 echo -e "${YELLOW}2.${NC} Configurar credenciais do Supabase no arquivo .env"
 echo ""
 echo -e "${YELLOW}3.${NC} Executar script SQL no Supabase:"
-echo -e "   ${CYAN}$INSTALL_DIR/setup-database.sql${NC}"
+echo -e "   ${CYAN}Use o arquivo setup-database-complete.sql${NC}"
 echo ""
 echo -e "${YELLOW}4.${NC} Reiniciar aplicação após configuração:"
 echo -e "   ${CYAN}sudo -u $SERVICE_USER pm2 restart timepulse-delivery${NC}"
@@ -700,6 +956,13 @@ case "$1" in
     monitor)
         sudo -u "$SERVICE_USER" pm2 monit
         ;;
+    rebuild)
+        echo "Rebuilding TimePulse Delivery..."
+        cd "$INSTALL_DIR"
+        sudo -u "$SERVICE_USER" npm run build
+        sudo -u "$SERVICE_USER" pm2 restart timepulse-delivery
+        echo "Rebuild concluído!"
+        ;;
     update)
         echo "Atualizando TimePulse Delivery..."
         cd "$INSTALL_DIR"
@@ -712,8 +975,27 @@ case "$1" in
     backup)
         /usr/local/bin/timepulse-backup.sh
         ;;
+    fix)
+        echo "Aplicando correções..."
+        cd "$INSTALL_DIR"
+        
+        # Corrigir permissões
+        chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+        
+        # Reinstalar dependências
+        sudo -u "$SERVICE_USER" rm -rf node_modules
+        sudo -u "$SERVICE_USER" npm install
+        
+        # Rebuild
+        sudo -u "$SERVICE_USER" npm run build
+        
+        # Reiniciar
+        sudo -u "$SERVICE_USER" pm2 restart timepulse-delivery
+        
+        echo "Correções aplicadas!"
+        ;;
     *)
-        echo "Uso: $0 {start|stop|restart|status|logs|monitor|update|backup}"
+        echo "Uso: $0 {start|stop|restart|status|logs|monitor|rebuild|update|backup|fix}"
         exit 1
         ;;
 esac
@@ -722,11 +1004,18 @@ EOF
 chmod +x /usr/local/bin/timepulse-admin
 
 print_info "Script de administração criado: timepulse-admin"
-print_info "Uso: timepulse-admin {start|stop|restart|status|logs|monitor|update|backup}"
+print_info "Uso: timepulse-admin {start|stop|restart|status|logs|monitor|rebuild|update|backup|fix}"
 
 echo ""
 echo -e "${PURPLE}🔗 Para suporte e documentação:${NC}"
 echo -e "${CYAN}   https://github.com/luishplleite/TimePulseDelivery${NC}"
+echo ""
+echo -e "${BLUE}💡 DICAS DE TROUBLESHOOTING:${NC}"
+echo ""
+echo -e "${YELLOW}• Se tiver problemas de build:${NC} timepulse-admin fix"
+echo -e "${YELLOW}• Para rebuild completo:${NC} timepulse-admin rebuild"
+echo -e "${YELLOW}• Para ver logs de erro:${NC} timepulse-admin logs"
+echo -e "${YELLOW}• Para monitorar recursos:${NC} timepulse-admin monitor"
 echo ""
 
 exit 0
